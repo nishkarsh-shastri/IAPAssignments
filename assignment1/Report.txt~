@@ -1,0 +1,9 @@
+﻿STP ENABLED TOPOLOGY
+In this topology a direct path from h1 to h2 was easily found using ARP packets as the Tree was formed between s1,s2 and s3 after sending the stp packets to every node in the topology. If you look at the wireshark capture of the switch interfaces named "swtich_capture_stp_enable.pcapng" there are intermittent STP packets that takes care of STP packets present in the network.
+We have the wireshark snapshots of H1 and H2 where client and server are present respectively. 
+The H1 is sending ARP packet first to get the details of server address. Once it receives the address of H2 it starts sending the UDP packets. 
+From "host1_stp_enable.pcapng" and "h2_capture_stp_enable.pcapng" we can see the ARP and UDP packets after applying filter. ARP packets return the target machine address as reply and then followed by UDP packets. These UDP packets can be seen in "swtich_capture_stp_enable.pcapng" also for the switches.
+
+
+STP DISABLED TOPOLOGY
+Note that there is no wireshark snapshots for this topology because of the flooding of network by the ARP packets. As a result of this whole network crashes and huge number of packets start flowing between the nodes. This is expected also as the network contains a loop between the switches which results in the ARP query looping and flooding the whole network. This behaviour can be observed from the beginning entries of wireshark after which it becomes unresponsive.
