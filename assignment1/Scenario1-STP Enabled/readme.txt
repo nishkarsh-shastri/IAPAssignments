@@ -9,19 +9,19 @@
 sudo wireshark
 
 ### Run wireshark in the hosts
-4) sudo ip netns exec h1 wireshark
-5) sudo ip netns exec h2 wireshark
+3) sudo ip netns exec h1 wireshark
+4) sudo ip netns exec h2 wireshark
 
 ### Set up executable client and server files ###
-4) Navigate to the datagram_client.c and datagram_server.c containing folders
-5) gcc datagram_server.c -o server
-6) gcc datagram_client.c -o client
-7) create two separate terminals in the same folder
+5) Navigate to the datagram_client.c and datagram_server.c containing folders
+6) gcc datagram_server.c -o server
+7) gcc datagram_client.c -o client
+8) create two separate terminals in the same folder
 
 ### Attach clients and server to the hosts ###
 
-8) sudo ip netns exec h2 ./server
-9) sudo ip netns exec h1 ./client
+9) sudo ip netns exec h2 ./server
+10) sudo ip netns exec h1 ./client
 
 ***Remove hosts and switches
-10) run the commands of delete_topology.sh to in bash at root to remove the switches and hosts.
+11) run the commands of delete_topology.sh to in bash at root to remove the switches and hosts.
