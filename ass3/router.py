@@ -214,8 +214,13 @@ ________________________________
 PWOSPF_HELLO_TYPE = 1
 PWOSPF_LSU_TYPE = 4
 HELLO_MIN_LEN = 32
+LSU_MIN_LEN = 32
+ADVERTISEMENT_SIZE = 12
 
 ALLSPFRouters = ip2int("224.0.0.5")
+
+class TopologyDatabase():
+
 
 class RouterHandler(EventMixin):
 	def __init__(self, connection, *ka, **kw):
@@ -476,13 +481,80 @@ class RouterHandler(EventMixin):
 		the time the packet was received to track the uptime of its neighbor.
 		"""
 		# Simply add neighbor of this interface
-		# TODO: calculate port_no, neighbor_id, neighbor_ip, timestamp
 		port_no = event.port
 		neighbor_id = router_id
 		neighbor_ip = srcip
 		timestamp = datetime.datetime.now()
 		interfaces[port_no].add_neighbor(neighbor_id, neighbor_ip, timestamp)
 		
+	def handle_lsu_packet(self, event, packet):
+		payload = packet.payload
+		scrip = ip2int(packet.srcip)
+		dstip = ip2int(packet.dstip)
+		"""
+		LSU Packet Format
+		 0                   1                   2                   3
+		 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|   Version #   |       4       |         Packet length         |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                          Router ID                            |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                           Area ID                             |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|           Checksum            |             Autype            |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                       Authentication                          |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                       Authentication                          |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|     Sequence                |          TTL                    |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                      # advertisements                         |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                                                               |
+		+-                                                            +-+
+		|                  Link state advertisements                    |
+		+-                                                            +-+
+		|                              ...                              |
+		"""
+		(version, pwospf_type, packet_length, router_id, area_id, checksum, 
+			autype, auth, sequence, ttl, n_advertisements) = struct.unpack('!BBHIIHHQHHI', payload[:LSU_MIN_LEN])
+		advertisements = payload[LSU_MIN_LEN:]
+
+		# Extract the advertisements
+		"""
+		Link state advertisements
+
+		Each link state update packet should contain 1 or more link state
+		advertisements.  The advertisements are the reachable routes directly
+		connected to the advertising router.  Routes are in the form of the subnet,
+		mask and router neighor for the attached link. Link state advertisements
+		look specifically as follows:
+
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                           Subnet                              |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                           Mask                                |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                         Router ID                             |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		"""
+		for i in range(n_advertisements):
+			(ad_subnet, ad_mask, ad_router_id) = struct.unpack('!III', advertisements[:ADVERTISEMENT_SIZE])
+			if i != (n_advertisements-1):
+				advertisements = advertisements[ADVERTISEMENT_SIZE:]
+
+		"""
+		If the LSU packet does not advertise a change in the state of the topology as is already reflected
+		in the database it is discarded and the sequence number is updated.  Otherwise, the information is
+		used to update the database and the router's forwarding tables are recalculated using Djikstra's algorithm.
+		"""
+		#TODO: Start Here
+		# Define a class for topology database
+		# Update the topology database with info of this interface
+		# 
+
 
 	def forward_pkt_to_next_hop(self, packet, match, event, route, justSend = False):
 		ipp = packet.find("ipv4")
