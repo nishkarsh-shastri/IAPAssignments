@@ -243,9 +243,10 @@ ________________________________
 PWOSPF_HELLO_TYPE = 1
 PWOSPF_LSU_TYPE = 4
 HELLO_MIN_LEN = 32
+LSU_MIN_LEN = 32
+ADVERTISEMENT_SIZE = 12
 
 ALLSPFRouters = ip2int("224.0.0.5")
-
 
 class RouterHandler(EventMixin):
 	def __init__(self, connection, *ka, **kw):
@@ -272,6 +273,18 @@ class RouterHandler(EventMixin):
 		self.lsuint = 30 # Default value
 		# Interface Information
 		self.interfaces = {}
+		"""
+		We want to make a adjacency graph of Routers and interfaces
+		Each node is router
+		Therefore topology_database will be a dictionary of router_id to list of neighbors
+		Here each entry in this list is (subnet, mask, router_id) tuple
+		"""
+		self.topology_database = {}
+		# We also need a dictionary of sequence numbers because we are implementing
+		# flooding and don't want to send old packets
+		self.topology_sequence_no = {}
+		
+
 
 		self.initialize_controller()
 
@@ -514,13 +527,13 @@ class RouterHandler(EventMixin):
 		the time the packet was received to track the uptime of its neighbor.
 		"""
 		# Simply add neighbor of this interface
-		# TODO: calculate port_no, neighbor_id, neighbor_ip, timestamp
 		port_no = event.port
 		neighbor_id = router_id
 		neighbor_ip = srcip
 		timestamp = datetime.datetime.now()
 		interfaces[port_no].add_neighbor(neighbor_id, neighbor_ip, timestamp, subnet, net_mask, packet.src)
 	# the following function sets hello timers and calls send_hello_packet periodically
+
 	def set_hello_timers(self):
         # for interfaces of router
         for port in self.connection.features.ports:
@@ -652,6 +665,158 @@ class RouterHandler(EventMixin):
 				#msg.in_port = port #doubt
 				self.connection.send(msg)
 
+	
+	def check_and_update_database(self, router_id, neighbors, sequence_no):
+		existing_neighbors = self.topology_database[router_id]
+		if not (set(neighbors) ^ set(existing_neighbors)): #symmetric difference
+			# no difference found
+			return False
+
+		self.topology_database[router_id] = existing_neighbors
+		self.topology_sequence_no[router_id] = sequence_no
+		return True
+
+	def get_interface_name_from_router_id(self, router_id):
+		for port_no, interface_data in self.interfaces.iteritems():
+			for neighbor_ip, value in interface_data.neighbors.iteritems():
+				neighbor_id = value[0]
+				if router_id == neighbor_id:
+					return self.port2intf[port_no]
+		return None
+
+	def recalcuate_routing_table(self):
+		# We have to calculate routing table from the topology_database
+		# Each element in the queue is a (current node, next hop) tuple
+		# We construct node to interface mapping in parallel
+		new_routing_table = RoutingTable()
+		visited, queue = set(), [(self.router_id, None)]
+		while queue:
+			vertex_router_id, next_hop = queue.pop(0)
+			if vertex_router_id in visited:
+				continue
+			if next_hop == None:
+				# this is the root node. All the next hops for its neighbors will be pointed to themselves
+				neighbors = self.topology_database[vertex_router_id]
+				for neighbor in neighbors:
+					# assign the next_hop as own router_id and push in the queue
+					subnet, mask, router_id = neighbor
+					if router_id in visited:
+						continue
+					queue.append((router_id, router_id))
+					# Create a routing table entry
+					port_name = self.get_interface_name_from_router_id(router_id)
+					mask_no = bin(mask).count('1')
+					subnet = int2ip(subnet)
+					subnet += "/" + str(mask_no)
+					new_routing_table.addEntry([subnet, int2ip(router_id), port_name])
+			else:
+				# this is not the root node. All the next hops for its neighbors will be pointed to the current_next_hop
+				neighbors = self.topology_database[vertex_router_id]
+				for neighbor in neighbors:
+					# assign the next_hop as current next_hop and push in the queue
+					subnet, mask, router_id = neighbor
+					if router_id in visited:
+						continue
+					queue.append((router_id, next_hop))
+					# Create a routing table entry
+					port_name = self.get_interface_name_from_router_id(next_hop)
+					mask_no = bin(mask).count('1')
+					subnet = int2ip(subnet)
+					subnet += "/" + str(mask_no)
+					new_routing_table.addEntry([subnet, int2ip(next_hop), port_name])
+			
+			visited.add(vertex_router_id)
+
+	def handle_lsu_packet(self, event, packet):
+		payload = packet.payload
+		scrip = ip2int(packet.srcip)
+		dstip = ip2int(packet.dstip)
+		"""
+		LSU Packet Format
+		 0                   1                   2                   3
+		 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|   Version #   |       4       |         Packet length         |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                          Router ID                            |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                           Area ID                             |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|           Checksum            |             Autype            |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                       Authentication                          |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                       Authentication                          |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|     Sequence                |          TTL                    |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                      # advertisements                         |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                                                               |
+		+-                                                            +-+
+		|                  Link state advertisements                    |
+		+-                                                            +-+
+		|                              ...                              |
+		"""
+		(version, pwospf_type, packet_length, router_id, area_id, checksum, 
+			autype, auth, sequence_no, ttl, n_advertisements) = struct.unpack('!BBHIIHHQHHI', payload[:LSU_MIN_LEN])
+		advertisements = payload[LSU_MIN_LEN:]
+
+		# Extract the advertisements
+		"""
+		Link state advertisements
+
+		Each link state update packet should contain 1 or more link state
+		advertisements.  The advertisements are the reachable routes directly
+		connected to the advertising router.  Routes are in the form of the subnet,
+		mask and router neighor for the attached link. Link state advertisements
+		look specifically as follows:
+
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                           Subnet                              |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                           Mask                                |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		|                         Router ID                             |
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+		"""
+		neighbors = []
+		for i in range(n_advertisements):
+			(ad_subnet, ad_mask, ad_router_id) = struct.unpack('!III', advertisements[:ADVERTISEMENT_SIZE])
+			neighbors.append((ad_subnet, ad_mask, ad_router_id))
+			if i != (n_advertisements-1):
+				advertisements = advertisements[ADVERTISEMENT_SIZE:]
+
+		########################## SANITY CHECKS ####################################
+		# Drop the packet when the packet received has started from self
+		if router_id == self.router_id:
+			# drop the packet
+			self.drop_packet(event)
+			return
+		
+		if router_id not in self.topology_database:
+			# first time entry
+			self.topology_database[router_id] = []
+			self.topology_sequence_no[router_id] = -1
+
+		# Drop the packet if it is older than current sequence number
+		if sequence_no <= self.topology_sequence_no[router_id]:
+			# drop the packet
+			self.drop_packet(event)
+			return
+		
+		# Drop the packet if the contents received from this packet is already present in the database
+		if not self.check_and_update_database(router_id, neighbors, sequence_no):
+			# drop the packet
+			self.drop_packet(event)
+			return
+
+		# If the code reaches here this implies that we have some changes in our existing database
+		# Thus we will recalculate the routing table based on current topology database
+		self.recalculate_routing_table()
+
+		# Reduce TTL and Forward the packets to other interfaces 
+>>>>>>> 84412b82050d14d7b2a84437b51cd7413bead31e
 
 
 	def forward_pkt_to_next_hop(self, packet, match, event, route, justSend = False):
