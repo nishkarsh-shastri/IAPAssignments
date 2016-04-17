@@ -6,9 +6,11 @@ from pox.lib.util import str_to_bool
 from pox.lib.packet import arp, icmp
 import pox.lib.packet as pkt
 from pox.lib.packet.ethernet import ethernet, ETHER_BROADCAST, ETHER_ANY
-from pox.lib.addresses import IPAddr, IP_ANY, IP_BROADCAST
+from pox.lib.addresses import IPAddr, IP_ANY, IP_BROADCAST, EthAddr
+from pox.lib.recoco import Timer
 # from pox.proto.arp_helper import *
 import time
+
 
 log = None
 if core != None:
@@ -19,6 +21,17 @@ SWITCH_TYPE_HUB         = 0x01
 SWiTCH_TYPE_ROUTER      = 0x02
 
 #TODO: remove this table, and use some file
+def carry_around_add(a, b):
+    c = a + b
+    return (c & 0xffff) + (c >> 16)
+def calc_checksum(msg):
+    s = 0
+    w = 0
+    for i in range(0, len(msg), 2):
+        w = ord(msg[i]) + (ord(msg[i+1]) << 8)
+        s = carry_around_add(s, w)
+    return ~s & 0xffff
+
 rtable = {}
 rtable["R1"] = [
 			['10.0.0.0/16', '192.0.4.2', 'R1-eth2'],
@@ -64,6 +77,13 @@ ROUTERS_IPS = {
 			"R2-eth3" : "10.0.2.1",
 			"R4-eth3" : "10.0.4.1"
 		}
+
+DEFAULT_PORTS = {
+	"R1" : 	"R1-eth1",
+	"R3" : "R3-eth2",
+	"R2" : "R2-eth3",
+	"R4" : "R4-eth3"
+}
 
 import datetime
 import struct
@@ -178,7 +198,8 @@ class RoutingTable():
 		return "[" + ", ".join(["<"+str(r)+">" for r in self.routingEntries]) + "]"
 
 
-HELLO_INT = 15
+HELLO_INT = 5
+LSUINT = 30
 class InterfaceData():
 	"""
 		An interface within a pwospf router is defined by the following values:
@@ -199,10 +220,18 @@ class InterfaceData():
 		self.neighbors = {} # neighbors is a dictionary of tuples
 		# Each tuple consist of neighbor_id, timestamp
 
-	def add_neighbor(self, neighbor_id, neighbor_ip, timestamp):
-		self.neighbors[neighbor_ip] = (neighbor_id, timestamp)
+	def add_neighbor(self, neighbor_id, neighbor_ip, timestamp, subnet, net_mask, src_mac):
+		self.neighbors[neighbor_ip] = Neighbor(neighbor_id, timestamp, subnet, net_mask, src_mac)
 
-
+class Neighbor(object):
+	"""docstring for Neighbor"""
+	def __init__(self, neighbor_id, timestamp, subnet, net_mask):
+		self.neighbor_id = neighbor_id
+		self.timestamp = timestamp 
+		self.subnet = subnet 
+		self.net_mask = net_mask
+		self.mac = src_mac
+		
 PWOSPF_PROTOCOL = 14
 PWOSPF_MIN_LEN = 24
 """
@@ -216,6 +245,7 @@ PWOSPF_LSU_TYPE = 4
 HELLO_MIN_LEN = 32
 
 ALLSPFRouters = ip2int("224.0.0.5")
+
 
 class RouterHandler(EventMixin):
 	def __init__(self, connection, *ka, **kw):
@@ -242,13 +272,13 @@ class RouterHandler(EventMixin):
 		self.lsuint = 30 # Default value
 		# Interface Information
 		self.interfaces = {}
-		
 
 		self.initialize_controller()
 
 		########### PWOSPF data population
 		self.initialize_pwospf_data()
-	
+		self.lsuTimer = Timer(timeToWake = LSUINT, callback= self.send_lsu_packet, absoluteTime=False, recurring=True, args=[])
+
 	def initialize_controller(self):
 		for port in self.connection.features.ports:
 			if self.name == "":
@@ -278,8 +308,7 @@ class RouterHandler(EventMixin):
 		self.interfaces = {}
 		for port_name, port_no in self.intf2Port.iteritems():
 			interface = InterfaceData()
-			interface.ip = ip2int(ROUTERS_IPS[port_name])
-
+			interface.ip = ip2int(ROUTERS_IPS[port_name])	
 			self.interfaces[port_no] = interface
 
 	def _handle_PacketIn (self, event):
@@ -429,6 +458,13 @@ class RouterHandler(EventMixin):
 		"""
 		(version, pwospf_type, packet_length, router_id, area_id, checksum, 
 			autype, auth) = struct.unpack('!BBHIIHHQ', payload[:PWOSPF_MIN_LEN])
+		checksum_calculated = calc_checksum(struct.pack('!BBHIIH', version, pwospf_type, packet_length, router_id, area_id, autype))
+		if checksum_calculated == checksum:
+			log.debug("CHECKSUM PEACE")
+		else:
+			log.debug("DROP PACKET INCORRECT CHECKSUM")
+			self.drop_packet(event)
+			return 
 		if pwospf_type == PWOSPF_HELLO_TYPE:
 			self.handle_hello_packet(event, packet)
 		elif pwospf_type == PWOSPF_LSU_TYPE:
@@ -440,6 +476,7 @@ class RouterHandler(EventMixin):
 		payload = packet.payload
 		scrip = ip2int(packet.srcip)
 		dstip = ip2int(packet.dstip)
+
 		"""
 		HELLO Packet Format 
 		 0                   1                   2                   3
@@ -464,6 +501,7 @@ class RouterHandler(EventMixin):
 		"""
 		(version, pwospf_type, packet_length, router_id, area_id, checksum, 
 			autype, auth, net_mask, helloint, padding) = struct.unpack('!BBHIIHHQIHH', payload[:HELLO_MIN_LEN])
+		subnet = src_ip & net_mask
 
 		#TODO: Check if packet is correct or not (CHECKSUM)
 		if(dstip != ALLSPFRouters):
@@ -481,8 +519,140 @@ class RouterHandler(EventMixin):
 		neighbor_id = router_id
 		neighbor_ip = srcip
 		timestamp = datetime.datetime.now()
-		interfaces[port_no].add_neighbor(neighbor_id, neighbor_ip, timestamp)
-		
+		interfaces[port_no].add_neighbor(neighbor_id, neighbor_ip, timestamp, subnet, net_mask, packet.src)
+	# the following function sets hello timers and calls send_hello_packet periodically
+	def set_hello_timers(self):
+        # for interfaces of router
+        for port in self.connection.features.ports:
+        	Timer(timeToWake = interfaces[port].helloint, callback= self.send_hello_packet, absoluteTime=False, recurring=True, args=[self.interfaces[port], port])
+
+    def send_hello_packet(self, interface, port):
+    	""" 
+	    		0                   1                   2                   3
+	      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |   Version #   |       1       |         Packet length         |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |                          Router ID                            |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |                           Area ID                             |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |           Checksum            |             Autype            |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |                       Authentication                          |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |                       Authentication                          |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |                        Network Mask                           |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     |         HelloInt              |           padding             |
+	     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	     """
+    	neighbors = interface.neighbors
+    	for neighbor in neighbors:
+    		src_ip = interface.ip
+    		dst_ip = neighbor
+    		version = 2
+    		packet_length = 32 # doubt
+    		router_id = self.router_id
+    		area_id = 0
+    		autype = 0 			
+    		auth = 0 			
+    		network_mask = interface.mask
+    		helloint = interface.helloint
+    		padding = 0 #doubt
+    		checksum = calc_checksum(struct.pack('!BBHIIH', version, 1, packet_length, router_id, area_id, autype))
+    		packet = struct.pack('!BBHIIHHQIHH', version, 1, packet_length, router_id, 
+    				area_id, checksum, autype, auth, network_mask, helloint, padding)
+			# Make the IP packet around it
+			ipp = pkt.ipv4()
+			ipp.protocol = ipp.PWOSPF_PROTOCOL
+			ipp.srcip = src_ip
+			ipp.dstip = ALLSPFRouters
+			ipp.payload = packet
+			e = pkt.ethernet()
+			e.src = self.port2Mac[self.intf2Port[route.intf]]
+			e.dst = "FF:FF:FF"
+			e.type = e.IP_TYPE
+			e.payload = ipp
+			
+			msg = of.ofp_packet_out()
+			msg.actions.append(of.ofp_action_output(port = port.port_no))
+			msg.data = e.pack()
+			#msg.in_port = port
+			self.connection.send(msg)
+
+	def send_lsu_packet(self):
+		"""
+		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |                           Subnet                              |
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |                           Mask                                |
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	   |                         Router ID                             |
+	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+		"""
+
+		lsu_data = list()
+		for port in self.connection.features.ports:
+			for neighbor in self.interfaces[port].neighbors:
+				subnet = self.interfaces[port].neighbors[neighbor].subnet
+				net_mask = self.interfaces[port].neighbors[neighbor].net_mask
+				router_id = self.interfaces[port].neighbors[neighbor].neighbor_id
+				# dest_ip = neighbor
+				# dest_id = self.interfaces[port].neighbors[neighbor][0]
+				# mask = self.interfaces[port].mask
+				# subnet = self.interfaces[port].ip & self.interfaces[port].mask
+
+				lsu_data.append(subnet)
+				lsu_data.append(net_mask)
+				lsu_data.append(router_id)
+			if(port.name==DEFAULT_PORTS[self.name]):
+				mask = self.interfaces[port].mask
+				ip = ROUTERS_IPS[port.name]
+				subnet = ip2int(ip) & mask
+				router_id = self.router_id
+				lsu_data.append(subnet, mask, router_id)
+		    		src_ip = interface.ip
+
+		packet = None
+		for port in self.connection.features.ports:
+			version = 2
+			packet_length = 32 # doubt
+			router_id = self.router_id
+			area_id = 0
+			autype = 0 			
+			auth = 0 			
+			network_mask = self.interfaces[port].mask
+			helloint = self.interfaces[port].helloint
+			padding = 0 #doubt
+			checksum = calc_checksum(struct.pack('!BBHIIH', version, 1, packet_length, router_id, area_id, autype))
+			packing_string = '!BBHIIHHQ'
+			for i in range(0,len(lsu_data)):
+				packing_string += 'I'
+			packet = struct.pack(packing_string, version, 4, packet_length, router_id, 
+					area_id, checksum, autype, auth, len(lsu_data)/3, lsu_data)
+			# Make the IP packet around it
+			for neighbor in self.interfaces[port].neighbors:
+				ipp = pkt.ipv4()
+				ipp.protocol = ipp.PWOSPF_PROTOCOL
+				ipp.srcip = self.interfaces[port].ip
+				ipp.dstip = neighbor
+				ipp.payload = packet
+				e = pkt.ethernet()
+				e.src = EthAddr(self.port2Mac[self.intf2Port[route.intf]])
+				e.dst = EthAddr(neighbor)
+				e.type = e.IP_TYPE
+				e.payload = ipp
+				
+				msg = of.ofp_packet_out()
+				msg.actions.append(of.ofp_action_output(port = port.port_no))
+				msg.data = e.pack()
+				#msg.in_port = port #doubt
+				self.connection.send(msg)
+
+
 
 	def forward_pkt_to_next_hop(self, packet, match, event, route, justSend = False):
 		ipp = packet.find("ipv4")
