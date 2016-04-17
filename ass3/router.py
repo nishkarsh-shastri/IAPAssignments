@@ -506,19 +506,56 @@ class RouterHandler(EventMixin):
 		self.topology_sequence_no[router_id] = sequence_no
 		return True
 
+	def get_interface_name_from_router_id(self, router_id):
+		for port_no, interface_data in self.interfaces.iteritems():
+			for neighbor_ip, value in interface_data.neighbors.iteritems():
+				neighbor_id = value[0]
+				if router_id == neighbor_id:
+					return self.port2intf[port_no]
+		return None
+
 	def recalcuate_routing_table(self):
 		# We have to calculate routing table from the topology_database
 		# Each element in the queue is a (current node, next hop) tuple
 		# We construct node to interface mapping in parallel
-
+		new_routing_table = RoutingTable()
 		visited, queue = set(), [(self.router_id, None)]
 		while queue:
 			vertex_router_id, next_hop = queue.pop(0)
-			if vertex_router_id not in visited:
-				visited.add(vertex)
-				neighbors = set(self.topology_database[vertex_router_id]) - visited
-				queue.extend(neighbors)
-		
+			if vertex_router_id in visited:
+				continue
+			if next_hop == None:
+				# this is the root node. All the next hops for its neighbors will be pointed to themselves
+				neighbors = self.topology_database[vertex_router_id]
+				for neighbor in neighbors:
+					# assign the next_hop as own router_id and push in the queue
+					subnet, mask, router_id = neighbor
+					if router_id in visited:
+						continue
+					queue.append((router_id, router_id))
+					# Create a routing table entry
+					port_name = self.get_interface_name_from_router_id(router_id)
+					mask_no = bin(mask).count('1')
+					subnet = int2ip(subnet)
+					subnet += "/" + str(mask_no)
+					new_routing_table.addEntry([subnet, int2ip(router_id), port_name])
+			else:
+				# this is not the root node. All the next hops for its neighbors will be pointed to the current_next_hop
+				neighbors = self.topology_database[vertex_router_id]
+				for neighbor in neighbors:
+					# assign the next_hop as current next_hop and push in the queue
+					subnet, mask, router_id = neighbor
+					if router_id in visited:
+						continue
+					queue.append((router_id, next_hop))
+					# Create a routing table entry
+					port_name = self.get_interface_name_from_router_id(next_hop)
+					mask_no = bin(mask).count('1')
+					subnet = int2ip(subnet)
+					subnet += "/" + str(mask_no)
+					new_routing_table.addEntry([subnet, int2ip(next_hop), port_name])
+			
+			visited.add(vertex_router_id)
 
 	def handle_lsu_packet(self, event, packet):
 		payload = packet.payload
