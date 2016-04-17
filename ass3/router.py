@@ -219,7 +219,6 @@ ADVERTISEMENT_SIZE = 12
 
 ALLSPFRouters = ip2int("224.0.0.5")
 
-class TopologyDatabase():
 
 
 class RouterHandler(EventMixin):
@@ -247,6 +246,16 @@ class RouterHandler(EventMixin):
 		self.lsuint = 30 # Default value
 		# Interface Information
 		self.interfaces = {}
+		"""
+		We want to make a adjacency graph of Routers and interfaces
+		Each node is router
+		Therefore topology_database will be a dictionary of router_id to list of neighbors
+		Here each entry in this list is (subnet, mask, router_id) tuple
+		"""
+		self.topology_database = {}
+		# We also need a dictionary of sequence numbers because we are implementing
+		# flooding and don't want to send old packets
+		self.topology_sequence_no = {}
 		
 
 		self.initialize_controller()
@@ -486,7 +495,31 @@ class RouterHandler(EventMixin):
 		neighbor_ip = srcip
 		timestamp = datetime.datetime.now()
 		interfaces[port_no].add_neighbor(neighbor_id, neighbor_ip, timestamp)
+	
+	def check_and_update_database(self, router_id, neighbors, sequence_no):
+		existing_neighbors = self.topology_database[router_id]
+		if not (set(neighbors) ^ set(existing_neighbors)): #symmetric difference
+			# no difference found
+			return False
+
+		self.topology_database[router_id] = existing_neighbors
+		self.topology_sequence_no[router_id] = sequence_no
+		return True
+
+	def recalcuate_routing_table(self):
+		# We have to calculate routing table from the topology_database
+		# Each element in the queue is a (current node, next hop) tuple
+		# We construct node to interface mapping in parallel
+
+		visited, queue = set(), [(self.router_id, None)]
+		while queue:
+			vertex_router_id, next_hop = queue.pop(0)
+			if vertex_router_id not in visited:
+				visited.add(vertex)
+				neighbors = set(self.topology_database[vertex_router_id]) - visited
+				queue.extend(neighbors)
 		
+
 	def handle_lsu_packet(self, event, packet):
 		payload = packet.payload
 		scrip = ip2int(packet.srcip)
@@ -519,7 +552,7 @@ class RouterHandler(EventMixin):
 		|                              ...                              |
 		"""
 		(version, pwospf_type, packet_length, router_id, area_id, checksum, 
-			autype, auth, sequence, ttl, n_advertisements) = struct.unpack('!BBHIIHHQHHI', payload[:LSU_MIN_LEN])
+			autype, auth, sequence_no, ttl, n_advertisements) = struct.unpack('!BBHIIHHQHHI', payload[:LSU_MIN_LEN])
 		advertisements = payload[LSU_MIN_LEN:]
 
 		# Extract the advertisements
@@ -540,20 +573,42 @@ class RouterHandler(EventMixin):
 		|                         Router ID                             |
 		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 		"""
+		neighbors = []
 		for i in range(n_advertisements):
 			(ad_subnet, ad_mask, ad_router_id) = struct.unpack('!III', advertisements[:ADVERTISEMENT_SIZE])
+			neighbors.append((ad_subnet, ad_mask, ad_router_id))
 			if i != (n_advertisements-1):
 				advertisements = advertisements[ADVERTISEMENT_SIZE:]
 
-		"""
-		If the LSU packet does not advertise a change in the state of the topology as is already reflected
-		in the database it is discarded and the sequence number is updated.  Otherwise, the information is
-		used to update the database and the router's forwarding tables are recalculated using Djikstra's algorithm.
-		"""
-		#TODO: Start Here
-		# Define a class for topology database
-		# Update the topology database with info of this interface
-		# 
+		########################## SANITY CHECKS ####################################
+		# Drop the packet when the packet received has started from self
+		if router_id == self.router_id:
+			# drop the packet
+			self.drop_packet(event)
+			return
+		
+		if router_id not in self.topology_database:
+			# first time entry
+			self.topology_database[router_id] = []
+			self.topology_sequence_no[router_id] = -1
+
+		# Drop the packet if it is older than current sequence number
+		if sequence_no <= self.topology_sequence_no[router_id]:
+			# drop the packet
+			self.drop_packet(event)
+			return
+		
+		# Drop the packet if the contents received from this packet is already present in the database
+		if not self.check_and_update_database(router_id, neighbors, sequence_no):
+			# drop the packet
+			self.drop_packet(event)
+			return
+
+		# If the code reaches here this implies that we have some changes in our existing database
+		# Thus we will recalculate the routing table based on current topology database
+		self.recalculate_routing_table()
+
+		# Reduce TTL and Forward the packets to other interfaces 
 
 
 	def forward_pkt_to_next_hop(self, packet, match, event, route, justSend = False):
