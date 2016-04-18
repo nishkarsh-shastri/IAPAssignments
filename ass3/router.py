@@ -608,12 +608,16 @@ class RouterHandler(EventMixin):
 	# the following function sets hello timers and calls send_hello_packet periodically
 	def drop_link(self, neighbor_id, port_no):
 		print "LINK DROPPED :o"
+		print self.topology_database
 		del self.topology_database[neighbor_id]
-		del self.interfaces[port_no].neighbors[neighbor_id]
+		print self.interfaces[port_no].neighbors
+		for port, interface in self.interfaces.iteritems():
+			if neighbor_id in interface.neighbors:
+				del self.interfaces[port_no].neighbors[neighbor_id]
 		print "RECALCULATE WILL BE CALLED DUE TO LINK DROP"
-		recalculate_routing_table()
+		self.recalculate_routing_table()
 		print "LSU PACKETS WILL BE SENT"
-		send_lsu_packet()
+		self.send_lsu_packet()
 	def set_hello_timers(self):
 		# for interfaces of router
 		i = 0
